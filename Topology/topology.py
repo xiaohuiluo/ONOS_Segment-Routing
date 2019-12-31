@@ -65,7 +65,7 @@ class SimplePktSwitch(Topo):
 	self.addLink(s9, s0)
 
 def run():
-    c = RemoteController('c', '192.168.56.1')
+    c = RemoteController('c', '127.0.0.1')
     net = Mininet(topo=SimplePktSwitch(), host=CPULimitedHost, controller=None)
     net.addController(c)
     net.start()

@@ -13,7 +13,11 @@ import org.onosproject.app.ApplicationAdminService;
 import org.onlab.packet.*;
 
 import static org.onlab.packet.MplsLabel.mplsLabel;
+
+import org.onosproject.net.host.HostService;
+import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.packet.InboundPacket;
+import org.onosproject.net.packet.OutboundPacket;
 import org.onosproject.net.packet.PacketContext;
 import org.onosproject.net.packet.PacketPriority;
 import org.onosproject.net.packet.PacketService;
@@ -63,6 +67,7 @@ import org.onosproject.cfg.ComponentConfigService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.ByteBuffer;
 import java.util.*;
 
 
@@ -82,6 +87,9 @@ public class SegmentRouting implements ServiceSR{
     protected DeviceService deviceService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected HostService hostService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected TopologyService topologyService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
@@ -93,23 +101,16 @@ public class SegmentRouting implements ServiceSR{
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected ComponentConfigService cfgService;
 
-    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected ApplicationAdminService applicationAdminService;
-
 
     @Property(name = "matchIpv4Address", boolValue = true,
-            label = "Enable matching IPv4 Addresses; default is false")
+            label = "Enable matching IPv4 Addresses; default is true")
     private boolean matchIpv4Address = true;
-
 
     private ReactivePacketProcessor processor = new ReactivePacketProcessor();
 
     private final TopologyListener topologyListener = new InternalTopologyListener();
 
-
     private ApplicationId appId;
-    private ApplicationId onosforwarding;
-    private final boolean deactivate_onos_app = true;
 
     private ArrayList<Device> devices = new ArrayList<>();
     private HashMap<DeviceId, Integer> labDevice = new HashMap<>();
@@ -126,18 +127,6 @@ public class SegmentRouting implements ServiceSR{
 
         cfgService.registerProperties(getClass());
         appId = coreService.registerApplication("DS_SR");
-        onosforwarding = coreService.getAppId("org.onosproject.fwd");
-
-        if (deactivate_onos_app) {
-            /* deactivate org.onos.fwd, only if it is appropriate */
-            try {
-                applicationAdminService.deactivate(onosforwarding);
-                log.info("### Deactivating Onos Reactive Forwarding App ###");
-
-            } catch (NullPointerException ne) {
-                log.info("#######"+ne.getMessage()+"#######");
-            }
-        }
 
         packetService.addProcessor(processor, PacketProcessor.director(2));
         topologyService.addListener(topologyListener);
@@ -160,6 +149,8 @@ public class SegmentRouting implements ServiceSR{
         }
 
         for(Device d: deviceService.getDevices()) {
+
+            log.info("Add init segment routing flow rule for={}", d.id());
 
             for(Device dev : devices){
 
@@ -203,6 +194,7 @@ public class SegmentRouting implements ServiceSR{
 
                                 checkFlowRule.add(labDevice.get(dev.id()));
                                 flowRuleService.applyFlowRules(InternalFlow);
+                                log.info("Add Internal flow rule={}", InternalFlow);
                             }
                         }
                     }
@@ -233,6 +225,8 @@ public class SegmentRouting implements ServiceSR{
 
                         flowRuleService.applyFlowRules(pen);
 
+                        log.info("Add pen flow rule={}", pen);
+
                         TrafficSelector selecto = DefaultTrafficSelector.builder()
                                 .matchMplsBos(false)
                                 .matchEthType(EthType.EtherType.MPLS_UNICAST.ethType().toShort())
@@ -256,6 +250,7 @@ public class SegmentRouting implements ServiceSR{
                                 .build();
 
                         flowRuleService.applyFlowRules(PopM);
+                        log.info("Add popM flow rule={}", PopM);
                     }
 
                 }
@@ -268,24 +263,14 @@ public class SegmentRouting implements ServiceSR{
     @Deactivate
     public void deactivate() {
 
-        if (deactivate_onos_app) {
-            try {
-                applicationAdminService.activate(onosforwarding);
-                log.info("### Activating Onos Reactive Forwarding App ###");
-            } catch (NullPointerException ne) {
-                log.info("#######"+ne.getMessage()+"#######");
-            }
-
-
-            cfgService.unregisterProperties(getClass(), false);
-            withdrawIntercepts();
-            packetService.removeProcessor(processor);
-            topologyService.removeListener(topologyListener);
-            processor = null;
-            flowRuleService.removeFlowRulesById(appId);
-            DB.clear();
-            log.info("Stopped");
-        }
+        cfgService.unregisterProperties(getClass(), false);
+        withdrawIntercepts();
+        packetService.removeProcessor(processor);
+        topologyService.removeListener(topologyListener);
+        processor = null;
+        flowRuleService.removeFlowRulesById(appId);
+        DB.clear();
+        log.info("Stopped");
     }
 
     @Modified
@@ -432,6 +417,7 @@ public class SegmentRouting implements ServiceSR{
                     .build();
 
             flowRuleService.applyFlowRules(HostToDev);
+            log.info("Add hostToDevice flow rule={}", HostToDev);
         }
 
     }
@@ -489,8 +475,30 @@ public class SegmentRouting implements ServiceSR{
                 return;
             }
 
+            if (isControlPacket(ethPkt)) {
+                return;
+            }
+
+            if (isIpv6Multicast(ethPkt)) {
+                return;
+            }
+
+
             // getting the packet payload
             IPacket payload = ethPkt.getPayload();
+
+            if (payload instanceof ARP) {
+                arpProxy(context, pkt);
+                return;
+            }
+
+            HostId id = HostId.hostId(ethPkt.getDestinationMAC());
+
+            Host dst = hostService.getHost(id);
+            if (dst == null) {
+                flood(context);
+                return;
+            }
 
             String srcIP="", dstIP="";
             boolean tcp = false, udp = false;
@@ -531,89 +539,154 @@ public class SegmentRouting implements ServiceSR{
             installRule(context, pkt.receivedFrom());
         }
 
-    }
+        private void arpProxy(PacketContext context, InboundPacket pkt) {
+            Ethernet ethPkt = pkt.parsed();
+            ARP arpPkt = (ARP) ethPkt.getPayload();
+            short opCode = arpPkt.getOpCode();
+            if (opCode == ARP.OP_REQUEST) {
+                Ip4Address dstIp = Ip4Address.valueOf(IPv4.toIPv4Address(arpPkt.getTargetProtocolAddress()));
+                Set<Host> hosts = hostService.getHostsByIp(dstIp);
+                if (hosts.iterator().hasNext()) {
+                    Host dstHost = hosts.iterator().next();
+                    MacAddress dstMac = dstHost.mac();
+                    Ethernet arpReply = ARP.buildArpReply(dstIp, dstMac, ethPkt);
 
-    // Install a rule forwarding for packet to the specified port.
-    private void installRule(PacketContext context, ConnectPoint connectP) {
-
-        Ethernet inPkt = context.inPacket().parsed();
-        IPv4 ipv4Packet = (IPv4) inPkt.getPayload();
-        Ip4Prefix addressDst = Ip4Prefix.valueOf(ipv4Packet.getDestinationAddress(),Ip4Prefix.MAX_MASK_LENGTH);
-        Ip4Prefix addressSrt = Ip4Prefix.valueOf(ipv4Packet.getSourceAddress(),Ip4Prefix.MAX_MASK_LENGTH);
-
-        DeviceId deviceDst = FromAddresstoDevice(addressDst);
-        Integer label = labDevice.get(deviceDst);
-        ArrayList address = new ArrayList<Ip4Prefix>(2);
-        address.add(addressSrt);
-        address.add(addressDst);
-
-        if(checkinDatabase(addressSrt,addressDst) && !checkinFlowDatabase(getNamefromDatabase(addressSrt,addressDst))){
-
-           installFlowRoute(getNamefromDatabase(addressSrt,addressDst));
-
-        }
-
-        else {
-
-            List<Link> LinkFollow = ShortestPath(connectP.deviceId(), deviceDst);
-
-
-            if (!NotNeighbor(connectP.deviceId(), deviceDst)) {
-
-                TrafficSelector selector = DefaultTrafficSelector.builder()
-                        .matchEthType(EthType.EtherType.IPV4.ethType().toShort())
-                        .matchIPSrc(Ip4Prefix.valueOf(ipv4Packet.getSourceAddress(), Ip4Prefix.MAX_MASK_LENGTH))
-                        .matchIPDst(Ip4Prefix.valueOf(ipv4Packet.getDestinationAddress(), Ip4Prefix.MAX_MASK_LENGTH))
-                        .build();
-
-                TrafficTreatment treatment = DefaultTrafficTreatment.builder()
-                        .immediate()
-                        .setOutput(LinkFollow.get(0).src().port())
-                        .build();
-
-                FlowRule IpFlow = DefaultFlowRule.builder()
-                        .forDevice(connectP.deviceId())
-                        .forTable(0)
-                        .fromApp(appId)
-                        .makePermanent()
-                        .withPriority(10)
-                        .withSelector(selector)
-                        .withTreatment(treatment)
-                        .build();
-
-                flowRuleService.applyFlowRules(IpFlow);
-
-            } else {
-
-                TrafficSelector selector = DefaultTrafficSelector.builder()
-                        .matchEthType(EthType.EtherType.IPV4.ethType().toShort())
-                        .matchIPSrc(Ip4Prefix.valueOf(ipv4Packet.getSourceAddress(), Ip4Prefix.MAX_MASK_LENGTH))
-                        .matchIPDst(Ip4Prefix.valueOf(ipv4Packet.getDestinationAddress(), Ip4Prefix.MAX_MASK_LENGTH))
-                        .build();
-
-                TrafficTreatment treatment = DefaultTrafficTreatment.builder()
-                        .immediate()
-                        .pushMpls().setMpls(mplsLabel(label))
-                        .setOutput(LinkFollow.get(0).src().port())
-                        .build();
-
-                FlowRule IPtoMPLS = DefaultFlowRule.builder()
-                        .forDevice(connectP.deviceId())
-                        .forTable(0)
-                        .fromApp(appId)
-                        .makePermanent()
-                        .withPriority(10)
-                        .withSelector(selector)
-                        .withTreatment(treatment)
-                        .build();
-
-                if(IPtoMPLS != null) flowRulesAuto.put(address,IPtoMPLS);
-
-                flowRuleService.applyFlowRules(IPtoMPLS);
-
+                    sendPacketOut(pkt.receivedFrom().deviceId(), pkt.receivedFrom().port(), arpReply);
+                    log.info("ARP proxy reply={}", arpReply);
+                } else {
+                    flood(context);
+                }
             }
         }
+
+        private boolean isControlPacket(Ethernet eth) {
+            short type = eth.getEtherType();
+            return type == Ethernet.TYPE_LLDP || type == Ethernet.TYPE_BSN;
+        }
+
+        private boolean isIpv6Multicast(Ethernet eth) {
+            return eth.getEtherType() == Ethernet.TYPE_IPV6 && eth.isMulticast();
+        }
+
+        // Floods the specified packet if permissible.
+        private void flood(PacketContext context) {
+            if (topologyService.isBroadcastPoint(topologyService.currentTopology(),
+                                                 context.inPacket().receivedFrom())) {
+                packetOut(context, PortNumber.FLOOD);
+            } else {
+                context.block();
+            }
+        }
+
+        // Sends a packet out the specified port.
+        private void packetOut(PacketContext context, PortNumber portNumber) {
+            context.treatmentBuilder().setOutput(portNumber);
+            context.send();
+        }
+
+
+        private void sendPacketOut(DeviceId deviceId, PortNumber portNumber,
+                                   Ethernet payload) {
+            TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                    .setOutput(portNumber).build();
+            OutboundPacket packet = new DefaultOutboundPacket(deviceId, treatment,
+                                                              ByteBuffer
+                                                                      .wrap(payload
+                                                                                    .serialize()));
+            packetService.emit(packet);
+        }
+
+        // Install a rule forwarding for packet to the specified port.
+        private void installRule(PacketContext context, ConnectPoint connectP) {
+
+            Ethernet inPkt = context.inPacket().parsed();
+            IPacket payload = inPkt.getPayload();
+
+            IPv4 ipv4Packet = (IPv4) payload;
+            Ip4Prefix addressDst = Ip4Prefix.valueOf(ipv4Packet.getDestinationAddress(),Ip4Prefix.MAX_MASK_LENGTH);
+            Ip4Prefix addressSrt = Ip4Prefix.valueOf(ipv4Packet.getSourceAddress(),Ip4Prefix.MAX_MASK_LENGTH);
+
+            DeviceId deviceDst = FromAddresstoDevice(addressDst);
+            Integer label = labDevice.get(deviceDst);
+            ArrayList address = new ArrayList<Ip4Prefix>(2);
+            address.add(addressSrt);
+            address.add(addressDst);
+
+            if(checkinDatabase(addressSrt,addressDst) && !checkinFlowDatabase(getNamefromDatabase(addressSrt,addressDst))){
+
+                // segment routing
+                installFlowRoute(getNamefromDatabase(addressSrt,addressDst));
+
+            }
+            else {
+
+                // mpls tunnel
+                List<Link> LinkFollow = ShortestPath(connectP.deviceId(), deviceDst);
+
+
+                if (!NotNeighbor(connectP.deviceId(), deviceDst)) {
+
+                    TrafficSelector selector = DefaultTrafficSelector.builder()
+                            .matchEthType(EthType.EtherType.IPV4.ethType().toShort())
+                            .matchIPSrc(Ip4Prefix.valueOf(ipv4Packet.getSourceAddress(), Ip4Prefix.MAX_MASK_LENGTH))
+                            .matchIPDst(Ip4Prefix.valueOf(ipv4Packet.getDestinationAddress(), Ip4Prefix.MAX_MASK_LENGTH))
+                            .build();
+
+                    TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                            .immediate()
+                            .setOutput(LinkFollow.get(0).src().port())
+                            .build();
+
+                    FlowRule IpFlow = DefaultFlowRule.builder()
+                            .forDevice(connectP.deviceId())
+                            .forTable(0)
+                            .fromApp(appId)
+                            .makePermanent()
+                            .withPriority(10)
+                            .withSelector(selector)
+                            .withTreatment(treatment)
+                            .build();
+
+                    flowRuleService.applyFlowRules(IpFlow);
+
+                    log.info("Add ip rule={}", IpFlow);
+
+                } else {
+
+                    TrafficSelector selector = DefaultTrafficSelector.builder()
+                            .matchEthType(EthType.EtherType.IPV4.ethType().toShort())
+                            .matchIPSrc(Ip4Prefix.valueOf(ipv4Packet.getSourceAddress(), Ip4Prefix.MAX_MASK_LENGTH))
+                            .matchIPDst(Ip4Prefix.valueOf(ipv4Packet.getDestinationAddress(), Ip4Prefix.MAX_MASK_LENGTH))
+                            .build();
+
+                    TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                            .immediate()
+                            .pushMpls().setMpls(mplsLabel(label))
+                            .setOutput(LinkFollow.get(0).src().port())
+                            .build();
+
+                    FlowRule IPtoMPLS = DefaultFlowRule.builder()
+                            .forDevice(connectP.deviceId())
+                            .forTable(0)
+                            .fromApp(appId)
+                            .makePermanent()
+                            .withPriority(10)
+                            .withSelector(selector)
+                            .withTreatment(treatment)
+                            .build();
+
+                    if(IPtoMPLS != null) flowRulesAuto.put(address,IPtoMPLS);
+
+                    flowRuleService.applyFlowRules(IPtoMPLS);
+
+                    log.info("Add ip to MPLS rule={}", IPtoMPLS);
+
+                }
+            }
+        }
+
     }
+
 
     private class InternalTopologyListener implements TopologyListener {
         @Override
@@ -651,6 +724,7 @@ public class SegmentRouting implements ServiceSR{
 
         labels.add(labDevice.get(FromAddresstoDevice(routeSR.getDstIp())));
         Collections.reverse(labels);
+        log.info("Route={}, Labels:{}", nameRoute, labels);
 
         TrafficSelector selector = DefaultTrafficSelector.builder()
                 .matchEthType(EthType.EtherType.IPV4.ethType().toShort())
@@ -680,6 +754,8 @@ public class SegmentRouting implements ServiceSR{
                 .build();
 
         flowRuleService.applyFlowRules(route);
+
+        log.info("Add segment routing flow={}", route);
 
         if(route != null) flowRulesInstalled.put(route, routeSR.getRouteName());
 

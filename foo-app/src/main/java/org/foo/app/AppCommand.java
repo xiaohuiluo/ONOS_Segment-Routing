@@ -28,7 +28,7 @@ import java.util.Map;
  * Sample Apache Karaf CLI command
  */
 @Command(scope = "onos",
-        name = "Segment_Routing",
+        name = "sr",
         description = "Use Segment Routing between node")
 
 public class AppCommand extends AbstractShellCommand {

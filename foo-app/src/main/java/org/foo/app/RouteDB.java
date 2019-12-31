@@ -10,7 +10,7 @@ import java.util.Map;
 
 
 @Command( scope = "onos",
-            name = "DB_route",
+            name = "db_route",
             description = "Return the Route DB",
             detailedDescription = "Return the Route DB")
 
